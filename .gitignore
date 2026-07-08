@@ -1,0 +1,48 @@
+# ========== CMake / 编译产物 ==========
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+Makefile
+*.cmake.user
+
+# ========== 二进制 / 链接库 / 目标文件 ==========
+*.o
+*.a
+*.so
+*.out
+fstack_udp_recv
+gen_udp_pcap
+
+# ========== 打流 / 落盘产物（不入库）==========
+*.pcap
+*.bin
+sender/*.pcap
+sender/build/
+
+# ========== 测试输出目录（保留 .gitkeep）==========
+test/output/*
+!test/output/.gitkeep
+
+# ========== 日志与临时文件 ==========
+*.log
+*.tmp
+*.swp
+*~
+
+# ========== 编辑器 / IDE ==========
+.vscode/
+.idea/
+*.code-workspace
+
+# ========== 系统文件 ==========
+.DS_Store
+Thumbs.db
+
+# ========== Core dump ==========
+core
+core.*
+vgcore.*
