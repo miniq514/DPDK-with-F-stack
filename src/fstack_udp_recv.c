@@ -43,6 +43,11 @@
 #include <rte_mempool.h>
 #include <rte_errno.h>
 #include <rte_common.h>
+#include <rte_byteorder.h>
+#include <rte_ether.h>
+#include <rte_ip.h>
+#include <rte_udp.h>
+#include <rte_pause.h>
 
 /* ============ 全局状态 ============ */
 
@@ -56,7 +61,15 @@ static int g_sockfd = -1; /* UDP socket 文件描述符 */
 static int g_sock_ready = 0; /* socket 须在 ff_run 回调内完成 bind */
 static int g_stats_emitted = 0; /* 避免重复打印统计 */
 
-/* Ctrl+C 后 ff_stop_run 退出会触发 F-Stack/DPDK double-free；先打统计再 _exit */
+/* 半旁路：dispatcher 在 process_packets 内同步回调，与 rx_loop 同 lcore */
+static struct rx_loop_ctx *g_bypass_lctx = NULL;
+static uint16_t            g_bypass_port = 0;
+
+/*
+ * Ctrl+C / 收满后若直接返回 ff_run，F-Stack/DPDK teardown 可能 double-free；
+ * 因此仍用 _exit 跳过 teardown。但 _exit 前必须 join writer，否则
+ * udp_writer_flush 里的 O_DIRECT ftruncate（去掉尾部对齐补零）来不及执行。
+ */
 static void pipeline_emit_stats(const struct rx_loop_ctx *lctx,
                                 const struct udp_writer_stats *ws)
 {
@@ -72,19 +85,39 @@ static void pipeline_emit_stats(const struct rx_loop_ctx *lctx,
     fflush(stdout);
 }
 
+/* 通知 writer 排空并 join，确保 flush/ftruncate/fsync 完成 */
+static void pipeline_drain_writer(struct writer_ctx *wctx)
+{
+    if (!wctx)
+        return;
+
+    wctx->rx_done = 1;
+    if (!wctx->tid_valid)
+        return;
+
+    if (pthread_join(wctx->tid, NULL) != 0)
+        perror("pthread_join(writer)");
+    wctx->tid_valid = 0;
+}
+
 static void pipeline_exit_now(struct rx_loop_ctx *lctx, const char *reason)
 {
+    const struct udp_writer_stats *ws = NULL;
+
     if (!lctx || !lctx->cfg || !lctx->stats)
         _exit(1);
-
-    if (lctx->wctx)
-        lctx->wctx->rx_done = 1;
 
     status_msg("[*] %s: matched %" PRIu64 "/%u packets (total_rx=%" PRIu64 ")",
                reason, lctx->stats->udp_matched, lctx->cfg->expected_pkts,
                lctx->stats->total_rx);
 
-    pipeline_emit_stats(lctx, NULL);
+    /* 先等落盘收尾（含 O_DIRECT 尾零 ftruncate），再打统计并 _exit */
+    pipeline_drain_writer(lctx->wctx);
+    if (lctx->wctx) {
+        lctx->stats->writer_errors += lctx->wctx->writer_errors;
+        ws = &lctx->wctx->wstats;
+    }
+    pipeline_emit_stats(lctx, ws);
 
     if (lctx->cfg->expected_pkts > 0 &&
         lctx->stats->udp_matched < lctx->cfg->expected_pkts) {
@@ -225,6 +258,10 @@ void parse_app_args(int argc, char **argv, struct app_config *cfg)
     cfg->expected_payload_size = UDP_RX_PAYLOAD_SIZE; /* 1344，与 sender pcap 对齐 */
     cfg->rx_cpu                = 0;
     cfg->writer_cpu            = 1;
+    cfg->traffic_only          = 0;
+    cfg->max_conns             = 1;
+    cfg->zc_recv               = 0;
+    cfg->udp_bypass            = 0;
 
     if (argc <= 0)
         return;
@@ -254,13 +291,15 @@ void parse_app_args(int argc, char **argv, struct app_config *cfg)
         {"payload-size",   required_argument, NULL, 's'},
         {"rx-cpu",         required_argument, NULL, 'x'},
         {"writer-cpu",     required_argument, NULL, 'w'},
+        {"zc-recv",        no_argument,       NULL, 'z'},
+        {"udp-bypass",     no_argument,       NULL, 'b'},
         {NULL, 0, NULL, 0}
     };
 
     int opt;
     optind = 1;
     // 分配解析方式
-    while ((opt = getopt_long(optc, optv, "o:p:e:rs:R:x:w:", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(optc, optv, "o:p:e:rs:R:x:w:zb", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'o':
             cfg->output_path = optarg;
@@ -290,6 +329,12 @@ void parse_app_args(int argc, char **argv, struct app_config *cfg)
         case 'w':
             if (parse_i32_arg(optarg, &cfg->writer_cpu) < 0)
                 goto usage_fail;
+            break;
+        case 'z':
+            cfg->zc_recv = 1;
+            break;
+        case 'b':
+            cfg->udp_bypass = 1;
             break;
         default:
             goto usage_fail;
@@ -650,6 +695,166 @@ int rx_extract_payload(const struct app_config *cfg,
     return 0;
 }
 
+/*
+ * 半旁路 L2/L3/L4 解析（风格对齐 UDP_DPDK/DPDK/dpdk_udp_recv.c::parse_udp_packet）。
+ * dac 主路径为 IPv6；同时支持 IPv4。非目标 UDP / 扩展头 / ND 等返回 0，交给 F-Stack。
+ * @return >0 payload 长；0 非匹配；<0 帧损坏（仍交栈或丢弃由调用方决定）
+ */
+static int parse_l2_udp_payload(const uint8_t *data, uint32_t len,
+                                uint16_t target_port,
+                                const uint8_t **payload_out,
+                                uint32_t *payload_len_out)
+{
+    uint32_t l3_off;
+    uint16_t ether_type;
+
+    if (!data || !payload_out || !payload_len_out || len < 42)
+        return -1;
+
+    {
+        const struct rte_ether_hdr *eth = (const struct rte_ether_hdr *)data;
+        ether_type = rte_be_to_cpu_16(eth->ether_type);
+        l3_off = (uint32_t)sizeof(struct rte_ether_hdr);
+    }
+
+    /* 单层 802.1Q（若硬件未剥 VLAN） */
+    if (ether_type == RTE_ETHER_TYPE_VLAN) {
+        if (len < l3_off + 4 + 40)
+            return -1;
+        ether_type = rte_be_to_cpu_16(*(const uint16_t *)(data + l3_off + 2));
+        l3_off += 4;
+    }
+
+    if (ether_type == RTE_ETHER_TYPE_IPV6) {
+        const struct rte_ipv6_hdr *ip6;
+        const struct rte_udp_hdr *udp;
+        uint32_t udp_off;
+        uint16_t payload_len;
+        uint16_t udp_total;
+        uint32_t hdr_len;
+        uint32_t udp_payload_len;
+        uint32_t frame_avail;
+
+        if (len < l3_off + sizeof(struct rte_ipv6_hdr) + sizeof(struct rte_udp_hdr))
+            return -1;
+
+        ip6 = (const struct rte_ipv6_hdr *)(data + l3_off);
+        /* 无扩展头的直连 UDP；带扩展头的包交栈处理 */
+        if (ip6->proto != IPPROTO_UDP)
+            return 0;
+
+        udp_off = l3_off + (uint32_t)sizeof(struct rte_ipv6_hdr);
+        udp = (const struct rte_udp_hdr *)(data + udp_off);
+        if (rte_be_to_cpu_16(udp->dst_port) != target_port)
+            return 0;
+
+        payload_len = rte_be_to_cpu_16(ip6->payload_len);
+        udp_total = rte_be_to_cpu_16(udp->dgram_len);
+        if (payload_len < sizeof(struct rte_udp_hdr) ||
+            udp_total < sizeof(struct rte_udp_hdr))
+            return -1;
+
+        udp_payload_len = (uint32_t)udp_total - (uint32_t)sizeof(struct rte_udp_hdr);
+        if (udp_payload_len > (uint32_t)payload_len - sizeof(struct rte_udp_hdr))
+            udp_payload_len = (uint32_t)payload_len - sizeof(struct rte_udp_hdr);
+
+        hdr_len = udp_off + (uint32_t)sizeof(struct rte_udp_hdr);
+        if (len <= hdr_len || udp_payload_len == 0)
+            return 0;
+
+        frame_avail = len - hdr_len;
+        if (udp_payload_len > frame_avail)
+            udp_payload_len = frame_avail;
+
+        *payload_out = data + hdr_len;
+        *payload_len_out = udp_payload_len;
+        return (int)udp_payload_len;
+    }
+
+    if (ether_type == RTE_ETHER_TYPE_IPV4) {
+        const struct rte_ipv4_hdr *ip;
+        const struct rte_udp_hdr *udp;
+        uint8_t ip_ihl;
+        uint32_t udp_off;
+        uint16_t ip_total;
+        uint16_t udp_total;
+        uint32_t ip_payload_len;
+        uint32_t udp_payload_len;
+        uint32_t hdr_len;
+        uint32_t frame_avail;
+
+        if (len < l3_off + 20 + sizeof(struct rte_udp_hdr))
+            return -1;
+
+        ip = (const struct rte_ipv4_hdr *)(data + l3_off);
+        if (ip->next_proto_id != IPPROTO_UDP)
+            return 0;
+
+        ip_ihl = (uint8_t)((ip->version_ihl & 0x0F) * 4);
+        if (ip_ihl < 20)
+            return -1;
+
+        udp_off = l3_off + ip_ihl;
+        if (len < udp_off + sizeof(struct rte_udp_hdr))
+            return -1;
+
+        udp = (const struct rte_udp_hdr *)(data + udp_off);
+        if (rte_be_to_cpu_16(udp->dst_port) != target_port)
+            return 0;
+
+        ip_total = rte_be_to_cpu_16(ip->total_length);
+        udp_total = rte_be_to_cpu_16(udp->dgram_len);
+        if (ip_total < ip_ihl || udp_total < sizeof(struct rte_udp_hdr))
+            return -1;
+
+        ip_payload_len = (uint32_t)ip_total - ip_ihl;
+        if (ip_payload_len < sizeof(struct rte_udp_hdr))
+            return 0;
+
+        udp_payload_len = (uint32_t)udp_total - sizeof(struct rte_udp_hdr);
+        if (udp_payload_len > ip_payload_len - sizeof(struct rte_udp_hdr))
+            udp_payload_len = ip_payload_len - (uint32_t)sizeof(struct rte_udp_hdr);
+
+        hdr_len = udp_off + (uint32_t)sizeof(struct rte_udp_hdr);
+        if (len <= hdr_len || udp_payload_len == 0)
+            return 0;
+
+        frame_avail = len - hdr_len;
+        if (udp_payload_len > frame_avail)
+            udp_payload_len = frame_avail;
+
+        *payload_out = data + hdr_len;
+        *payload_len_out = udp_payload_len;
+        return (int)udp_payload_len;
+    }
+
+    return 0;
+}
+
+/*
+ * F-Stack process_packets 钩子：命中目标 UDP → 入应用 ring 并吞掉 mbuf；
+ * 其余（含 IPv6 ND）返回原 queue_id，继续走协议栈。
+ */
+static int udp_bypass_dispatcher(void *data, uint16_t *len,
+                                 uint16_t queue_id, uint16_t nb_queues)
+{
+    const uint8_t *payload = NULL;
+    uint32_t plen = 0;
+    int ret;
+
+    (void)nb_queues;
+    if (!g_bypass_lctx || !data || !len || *len == 0)
+        return (int)queue_id;
+
+    ret = parse_l2_udp_payload((const uint8_t *)data, (uint32_t)(*len),
+                               g_bypass_port, &payload, &plen);
+    if (ret <= 0 || !payload || plen == 0)
+        return (int)queue_id;
+
+    rx_handle_datagram(g_bypass_lctx, payload, (ssize_t)plen);
+    return FF_DISPATCH_ERROR;
+}
+
 // 将data拷贝入g_rx_ring
 int rx_enqueue_payload(const uint8_t *data, uint32_t len,
                               struct rx_stats *stats)
@@ -726,8 +931,12 @@ void rx_handle_datagram(struct rx_loop_ctx *lctx,
     stats->total_rx++;
     stats->total_rx_bytes += (uint64_t)n;
 
-    if (stats->total_rx == 1)
-        status_msg("[*] First UDP datagram from F-Stack (%zd B payload)", n);
+    if (stats->total_rx == 1) {
+        if (lctx->cfg->udp_bypass)
+            status_msg("[*] First UDP datagram via udp-bypass (%zd B payload)", n);
+        else
+            status_msg("[*] First UDP datagram from F-Stack (%zd B payload)", n);
+    }
 
     if (!lctx->timing_active) {
         lctx->tsc_start_ns = udp_rx_monotonic_ns();
@@ -795,17 +1004,26 @@ int rx_loop(void *arg)
         pipeline_exit_now(lctx, "Stopped by signal (Ctrl+C)");
     }
 
-    /* F-Stack 要求在 ff_run 回调内完成 socket bind */
+    /* F-Stack 要求在 ff_run 回调内完成 socket bind；半旁路不建 socket */
     if (!g_sock_ready) {
-        if (fstack_udp_socket_setup(lctx->cfg, &g_sockfd) < 0) {
+        if (lctx->cfg->udp_bypass) {
+            g_sock_ready = 1;
+            status_msg("[*] UDP bypass ready: dport=%u (no socket / sockbuf)",
+                       lctx->cfg->dst_port);
+            if (lctx->cfg->expected_pkts > 0 && UDP_RX_IDLE_EXIT_SEC > 0) {
+                status_msg("[*] 等待发端首包（首包到达前不计 idle；收满后或连续 %.0fs 无新包退出）",
+                           (double)UDP_RX_IDLE_EXIT_SEC);
+            }
+        } else if (fstack_udp_socket_setup(lctx->cfg, &g_sockfd) < 0) {
             fprintf(stderr, "[ERR] rx_loop: socket setup failed\n");
             ff_stop_run();
             return 0;
-        }
-        g_sock_ready = 1;
-        if (lctx->cfg->expected_pkts > 0 && UDP_RX_IDLE_EXIT_SEC > 0) {
-            status_msg("[*] 等待发端首包（首包到达前不计 idle；收满后或连续 %.0fs 无新包退出）",
-                       (double)UDP_RX_IDLE_EXIT_SEC);
+        } else {
+            g_sock_ready = 1;
+            if (lctx->cfg->expected_pkts > 0 && UDP_RX_IDLE_EXIT_SEC > 0) {
+                status_msg("[*] 等待发端首包（首包到达前不计 idle；收满后或连续 %.0fs 无新包退出）",
+                           (double)UDP_RX_IDLE_EXIT_SEC);
+            }
         }
     }
 
@@ -823,8 +1041,65 @@ int rx_loop(void *arg)
         }
     }
 
+    /* 半旁路：包已在 packet_dispatcher 入环，此处只做退出判定 */
+    if (lctx->cfg->udp_bypass)
+        goto check_exit;
+
     /* 单轮 burst 上限：与 writer 出环 burst 同量级，避免长占 ff_run */
     for (i = 0; i < (int)UDP_RX_WRITER_DESC_BURST * 4 && g_running; i++) {
+#ifdef FSTACK_ZC_RECV
+        if (lctx->cfg->zc_recv) {
+            struct ff_zc_mbuf zm;
+            ssize_t n;
+            void *seg = NULL;
+            int seglen = 0;
+            int got;
+
+            memset(&zm, 0, sizeof(zm));
+            n = ff_zc_recv(g_sockfd, &zm, RX_MAX_UDP_PAYLOAD);
+            if (n < 0) {
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    lctx->stats->payload_errors++;
+                    if (!recv_err_logged) {
+                        status_msg("[!] ff_zc_recv error: %s", strerror(errno));
+                        recv_err_logged = 1;
+                    }
+                }
+                break;
+            }
+            if (n == 0)
+                break;
+
+            /*
+             * UDP 通常单段；多段时拼到 static buf（仍省掉 soreceive→uiomove）。
+             * 入环落盘仍需拷到 cpbuf（writer 异步持有）。
+             */
+            got = ff_zc_mbuf_segment(&zm, &seg, &seglen);
+            if (got > 0 && seglen == (int)n && seg) {
+                rx_handle_datagram(lctx, (const uint8_t *)seg, n);
+            } else if (got > 0) {
+                size_t off = 0;
+                do {
+                    if (off + (size_t)seglen > sizeof(buf)) {
+                        lctx->stats->oversize_drops++;
+                        break;
+                    }
+                    memcpy(buf + off, seg, (size_t)seglen);
+                    off += (size_t)seglen;
+                    got = ff_zc_mbuf_segment(&zm, &seg, &seglen);
+                } while (got > 0);
+                if (off == (size_t)n)
+                    rx_handle_datagram(lctx, buf, n);
+                else
+                    lctx->stats->payload_errors++;
+            } else {
+                lctx->stats->payload_errors++;
+            }
+            ff_zc_recv_free(&zm);
+            continue;
+        }
+#endif /* FSTACK_ZC_RECV */
+
         fromlen = sizeof(from);
         ssize_t n = ff_recvfrom(g_sockfd, buf, sizeof(buf), 0,
                                 &from, &fromlen);
@@ -844,6 +1119,7 @@ int rx_loop(void *arg)
         rx_handle_datagram(lctx, buf, n);
     }
 
+check_exit:
     /* 收满退出：直接 _exit，避免 F-Stack/DPDK teardown 的 double-free */
     if (lctx->cfg->expected_pkts > 0 &&
         lctx->stats->udp_matched >= lctx->cfg->expected_pkts) {
@@ -907,6 +1183,8 @@ int run_recv_pipeline(const struct app_config *cfg)
         rx_channel_destroy();
         return -1;
     }
+    wctx.tid = wtid;
+    wctx.tid_valid = 1;
     while (wctx.state == 0) {
         if (!g_running) {
             /* 信号期间等待：让 writer 也看到退出意图 */
@@ -916,13 +1194,20 @@ int run_recv_pipeline(const struct app_config *cfg)
     }
     if (wctx.state < 0) {
         fprintf(stderr, "[ERR] run_recv_pipeline: writer init failed\n");
-        wctx.rx_done = 1;
-        pthread_join(wtid, NULL);
+        pipeline_drain_writer(&wctx);
         rx_channel_destroy();
         return -1;
     }
 
-    /* socket 在 rx_loop（ff_run 回调）内延迟创建 */
+    /* socket 在 rx_loop（ff_run 回调）内延迟创建；半旁路在此注册 L2 dispatcher */
+    if (cfg->udp_bypass) {
+        g_bypass_lctx = &lctx;
+        g_bypass_port = cfg->dst_port;
+        ff_regist_packet_dispatcher(udp_bypass_dispatcher);
+        status_msg("[*] Registered packet_dispatcher for UDP dport=%u (half-bypass)",
+                   cfg->dst_port);
+    }
+
     status_msg("[*] RX pipeline ready, entering ff_run (Ctrl+C to stop)");
 
     lctx.pipeline_t0_ns = udp_rx_monotonic_ns();
@@ -930,13 +1215,17 @@ int run_recv_pipeline(const struct app_config *cfg)
     ff_run(rx_loop, &lctx);
     total_sec = (double)(udp_rx_monotonic_ns() - t0) / 1e9;
 
-    /* 通知 writer 排空后退出 */
-    wctx.rx_done = 1;
-    pthread_join(wtid, NULL);
+    if (cfg->udp_bypass) {
+        ff_regist_packet_dispatcher(NULL);
+        g_bypass_lctx = NULL;
+    }
+
+    /* fallback：若未走 pipeline_exit_now，仍须 join writer 再 _exit */
+    pipeline_drain_writer(&wctx);
     stats.writer_errors += wctx.writer_errors;
 
     /*
-     * 正常退出（收满/idle）已经在 rx_loop 内直接 _exit；
+     * 正常退出（收满/idle/Ctrl+C）已经在 rx_loop 内经 pipeline_exit_now _exit；
      * 走到这里只可能是 F-Stack teardown 出错前的 fallback，直接 _exit。
      */
     pipeline_emit_stats(&lctx, &wctx.wstats);
@@ -970,9 +1259,24 @@ int main(int argc, char *argv[])
     parse_app_args(app_argc, app_argv, &cfg);
 
     printf("[*] Config: output=%s, dst_port=%u, expected_pkts=%u, "
-           "rx_cpu=%d, writer_cpu=%d\n",
+           "rx_cpu=%d, writer_cpu=%d, zc_recv=%d, udp_bypass=%d\n",
            cfg.output_path, cfg.dst_port, cfg.expected_pkts,
-           cfg.rx_cpu, cfg.writer_cpu);
+           cfg.rx_cpu, cfg.writer_cpu, cfg.zc_recv, cfg.udp_bypass);
+    if (cfg.udp_bypass && cfg.zc_recv) {
+        fprintf(stderr, "[ERR] --udp-bypass 与 --zc-recv 互斥\n");
+        return EXIT_FAILURE;
+    }
+    if (cfg.udp_bypass) {
+        status_msg("[*] Recv mode: udp-bypass (packet_dispatcher, skip sockbuf)");
+    } else if (cfg.zc_recv) {
+#ifdef FSTACK_ZC_RECV
+        status_msg("[*] Recv mode: ff_zc_recv (zero-copy from sockbuf mbuf)");
+#else
+        fprintf(stderr,
+                "[ERR] --zc-recv requested but binary built without FSTACK_ZC_RECV\n");
+        return EXIT_FAILURE;
+#endif
+    }
     if (cfg.raw_payload)
         status_msg("[*] Payload mode: raw passthrough (expected=%u)",
                    cfg.expected_payload_size);

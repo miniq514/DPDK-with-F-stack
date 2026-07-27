@@ -8,7 +8,7 @@
 #   link_profile_apply dac      # 或 fibre
 #   echo "$LINK_IFACE $LINK_PCI $LINK_IPV6 $LINK_DST_PORT $FSTACK_CONFIG"
 #
-# 1.0.1 起全 IPv6：dac 与 fibre 收端地址均为 …:0002；同一时刻只启用一条链路。
+# Fstack-DPDk_8004：dac 收端 …:0003（8004）；fibre 仍 …:0002（8004 不参与 fibre）。
 #
 # f0/f1（0000:42:00.0 / .1）同属一块 82599 的 IOMMU group；DPDK/VFIO 要求组内
 # 设备全部绑 vfio-pci（或全部未绑），仅绑单口会报 "VFIO group is not viable"。
@@ -17,15 +17,18 @@
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPTS_DIR}/.." && pwd)"
 
-FF_PATH="${FF_PATH:-/home/dev/HMH--8007/F-stack}"
+FF_PATH="${FF_PATH:-/home/cics/HMH/F-stack}"
 DEVBIND="${DEVBIND:-/usr/local/bin/dpdk-devbind.py}"
 # 本机 82599 与 PCIe 桥/igc 管理口同属 IOMMU group 11，vfio-pci 无法使组 viable；
 # uio_pci_generic 可单口绑定且已被 F-Stack/DPDK 支持。
-DPDK_BIND_DRIVER="${DPDK_BIND_DRIVER:-uio_pci_generic}"
+DPDK_BIND_DRIVER="${DPDK_BIND_DRIVER:-igb_uio}"
 DPDK_KERNEL_DRIVER="${DPDK_KERNEL_DRIVER:-ixgbe}"
 
-# 收端 IPv6（dac / fibre 收端统一 …:0002，与 docs/README 1.0.1 对齐）
-LINK_IPV6_RECV="1111:2222:1111:2222:1111:2222:1111:0002"
+# 收端 IPv6（8004 dac 收端 …:0003）
+LINK_IPV6_RECV="1111:2222:1111:2222:1111:2222:1111:0003"
+# KNI 运维口（virtio-user → veth0）；勿与 F-Stack addr6 相同，避免 ND 冲突
+LINK_OPS_IPV6="1111:2222:1111:2222:1111:2222:1111:0004"
+LINK_OPS_IFACE="veth0"
 LINK_IPV6_PREFIX=64
 LINK_UDP_PORT=8888
 
@@ -37,8 +40,8 @@ link_profile_apply() {
             LINK_PCI="0000:42:00.1"
             LINK_SIBLING_IFACE="enp66s0f0"
             LINK_SIBLING_PCI="0000:42:00.0"
-            LINK_MAC="90:e2:ba:50:aa:71"            # 8007 f1（dac 收端）
-            LINK_REMOTE_IPV6="1111:2222:1111:2222:1111:2222:1111:0003"  # 8004 发端
+            LINK_MAC="90:e2:ba:50:7c:f9"            # 8004 f1（dac 收端）
+            LINK_REMOTE_IPV6="1111:2222:1111:2222:1111:2222:1111:0002"  # 8007 发端
             FSTACK_CONFIG="${PROJECT_ROOT}/configs/config.dac.ini"
             ;;
         fibre)
@@ -62,7 +65,8 @@ link_profile_apply() {
     LINK_DST_PORT="${LINK_UDP_PORT}"
     export LINK_IFACE LINK_PCI LINK_SIBLING_IFACE LINK_SIBLING_PCI \
            LINK_MAC LINK_NAME LINK_IPV6 LINK_PREFIX \
-           LINK_DST_PORT LINK_REMOTE_IPV6 FSTACK_CONFIG FF_PATH DEVBIND PROJECT_ROOT \
+           LINK_DST_PORT LINK_REMOTE_IPV6 LINK_OPS_IPV6 LINK_OPS_IFACE \
+           FSTACK_CONFIG FF_PATH DEVBIND PROJECT_ROOT \
            DPDK_BIND_DRIVER DPDK_KERNEL_DRIVER
 }
 
@@ -169,6 +173,7 @@ link_profile_summary() {
     iface        : ${LINK_IFACE}
     pci          : ${LINK_PCI}
     recv ipv6    : ${LINK_IPV6}/${LINK_PREFIX}
+    ops ipv6     : ${LINK_OPS_IPV6}/${LINK_PREFIX} (${LINK_OPS_IFACE})
     remote ipv6  : ${LINK_REMOTE_IPV6}
     udp port     : ${LINK_DST_PORT}
     recv mac     : ${LINK_MAC}

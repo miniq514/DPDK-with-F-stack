@@ -18,6 +18,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# sender/ root; hugepage.sh via ${BUNDLE_DIR}/../scripts/lib
+BUNDLE_DIR="${SCRIPT_DIR}"
+
 CONFIG_H="${SCRIPT_DIR}/include/sender_config.h"
 GEN_BIN="${SCRIPT_DIR}/../build/sender/gen_udp_pcap"
 REPLAY_SH="${SCRIPT_DIR}/scripts/run_pktgen_replay.sh"
@@ -42,7 +45,7 @@ DST_PORT="${DST_PORT:-8888}"
 PAYLOAD_SIZE="${PAYLOAD_SIZE:-1336}"
 COUNT="${COUNT:-100}"
 PCAP_COUNT="${PCAP_COUNT:-}"   # pcap 模板包数；默认 100000（pktgen 循环至 --count）
-PCAP_TEMPLATE_MAX=100000
+PCAP_TEMPLATE_MAX=5000
 PCAP="${PCAP:-${SCRIPT_DIR}/udp_test.pcap}"
 
 RATE=""           # 线路速率百分比；空 = 100（线速）
@@ -389,50 +392,27 @@ bind_vfio_pci() {
 }
 
 hugepages_2m_count() {
-    if command -v dpdk-hugepages.py &>/dev/null; then
-        dpdk-hugepages.py --show 2>/dev/null | awk 'NR==2{print $2; exit}'
-        return 0
-    fi
-    cat /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages 2>/dev/null || echo 0
+    # 兼容旧调用：返回本机 2MB 大页总数（继承 /sys 配置）
+    # shellcheck source=../../scripts/lib/hugepage.sh
+    source "${BUNDLE_DIR}/../scripts/lib/hugepage.sh"
+    hugepages_2m_total
 }
 
 cleanup_stale_hugepages() {
-    rm -f /dev/hugepages/* 2>/dev/null || true
+    # shellcheck source=../../scripts/lib/hugepage.sh
+    source "${BUNDLE_DIR}/../scripts/lib/hugepage.sh"
+    HUGEPAGE_FILE_PREFIX="udp_pktgen_tx"
+    hugepages_cleanup_project_maps "${HUGEPAGE_FILE_PREFIX}"
 }
 
 setup_hugepages() {
-    local min_pages=512
-    local target="4G"
-    local cur
-
-    cur="$(hugepages_2m_count)"
-    cur="${cur:-0}"
-    if [[ "${cur}" -ge "${min_pages}" ]]; then
-        log "hugepages 已就绪: ${cur} x 2MB (>= ${min_pages})"
-        return 0
-    fi
-
-    if ! command -v dpdk-hugepages.py &>/dev/null; then
-        warn "未找到 dpdk-hugepages.py，当前 ${cur} x 2MB，建议手动配置 ≥512 页"
-        return 0
-    fi
-
-    log "配置 hugepages (2M x ${target})，当前 ${cur} 页 ..."
-    cleanup_stale_hugepages
-    if ! dpdk-hugepages.py -p 2M --setup "${target}" 2>&1; then
-        cur="$(hugepages_2m_count)"
-        cur="${cur:-0}"
-        if [[ "${cur}" -ge "${min_pages}" ]]; then
-            warn "hugepages 扩容报错，但现有 ${cur} x 2MB 已够用，继续"
-            return 0
-        fi
-        warn "hugepages 配置失败（可能被占用）"
-        warn "请先正常退出 pktgen，或: sudo rm -f /dev/hugepages/*; sudo dpdk-hugepages.py -p 2M --setup 4G"
-        return 1
-    fi
-
-    cur="$(hugepages_2m_count)"
-    log "hugepages 就绪: ${cur} x 2MB"
+    # shellcheck source=../../scripts/lib/hugepage.sh
+    source "${BUNDLE_DIR}/../scripts/lib/hugepage.sh"
+    HUGEPAGE_FILE_PREFIX="udp_pktgen_tx"
+    HUGEPAGE_MIN_TOTAL=512
+    HUGEPAGE_MIN_FREE=256
+    HUGEPAGE_EXPAND_TARGET="4G"
+    hugepages_ensure_inherit
 }
 
 setup_dpdk() {
@@ -489,9 +469,9 @@ run_send() {
     trap on_send_interrupt INT TERM
 
     echo ""
-    if [[ ! -t 0 && -r /dev/tty ]]; then
-        printf '收端就绪后按 Enter 开始 pktgen，Ctrl+C 取消 ... ' >/dev/tty
-        read -r _ </dev/tty || on_send_interrupt
+    # SSH/sshpass: skip prompt when non-interactive
+    if [[ "${NO_PROMPT:-0}" == "1" ]] || ! [[ -t 0 ]]; then
+        echo "[*] skip prompt (non-interactive / NO_PROMPT=1)"
     else
         read -r -p "收端就绪后按 Enter 开始 pktgen，Ctrl+C 取消 ... " _ || on_send_interrupt
     fi

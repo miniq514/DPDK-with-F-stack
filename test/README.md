@@ -92,11 +92,11 @@ bash test/verify_output.sh test/output/fixed_count.bin $((10000 * 1344))
 ```bash
 cd /home/dev/HMH--8007/Fstack-DPDk
 
-# 默认 count=1000 payload=1336（数据区），测 --to-8007 与 --to-8004 两个目标
+# 默认 count=1000 payload=1344，测 --to-8007 与 --to-8004 两个目标
 bash test/self_loop_pcap.sh
 
 # 自定义
-bash test/self_loop_pcap.sh --count 5000 --payload-size 1336
+bash test/self_loop_pcap.sh --count 5000 --payload-size 1344
 bash test/self_loop_pcap.sh --target 8007        # 仅测一个目标
 ```
 
@@ -105,7 +105,7 @@ bash test/self_loop_pcap.sh --target 8007        # 仅测一个目标
 | 参数 | 默认 | 说明 |
 |------|------|------|
 | `--count N` | `1000` | 生成包数 |
-| `--payload-size B` | `1336` | payload 数据区字节；raw 下 UDP payload = 8B头 + 1336B体 = 1344B |
+| `--payload-size B` | `1344` | payload 数据区字节（奇数会触发 checksum 补零路径） |
 | `--target 8007\|8004` | `8007 8004` | 测试目标（可只传一个） |
 
 **退出码：** `0`=全部通过，非 0=存在失败项。

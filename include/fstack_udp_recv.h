@@ -5,7 +5,8 @@
  * 实现均在 src/fstack_udp_recv.c；本头文件供阅读、对照实现与后续单测引用。
  *
  * 数据流：
- *   ff_recvfrom → rx_extract_payload → rx_enqueue_payload → rte_ring
+ *   默认: ff_recvfrom → rx_extract_payload → rx_enqueue_payload → rte_ring
+ *   --udp-bypass: packet_dispatcher 解析 Eth/IP/UDP → 同上（不进 sockbuf）
  *        → writer_thread_main → udp_writer_submit(io_uring) → 落盘
  */
 #ifndef FSTACK_UDP_RECV_H
@@ -15,6 +16,7 @@
 #include "udp_rx_timing.h"
 #include "udp_writer.h"
 
+#include <pthread.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -49,6 +51,8 @@ struct writer_ctx {
     volatile int            rx_done;      /* RX 置 1 表示不再入环，writer 排空后退出 */
     uint64_t                writer_errors;/* udp_writer_submit/flush 失败计数 */
     struct udp_writer_stats wstats;       /* 退出前从 udp_writer 快照 */
+    pthread_t               tid;          /* writer 线程；_exit 前须 join 以完成 ftruncate */
+    int                     tid_valid;    /* 1=pthread_create 成功，可 join */
 };
 
 /* ============ 应用层配置（"--" 之后解析） ============ */
@@ -61,6 +65,10 @@ struct app_config {
     uint32_t    expected_payload_size; /* raw 模式期望长度（仅统计，不丢弃） */
     int         rx_cpu;                /* --rx-cpu，RX/ff_run 倾向 CPU */
     int         writer_cpu;            /* --writer-cpu，writer 线程绑定 CPU */
+    int         traffic_only;          /* 1=只计流量，不落盘/不校验跨流序号 */
+    int         max_conns;             /* TCP 最大并发连接（多核发端） */
+    int         zc_recv;               /* 1=UDP 使用 ff_zc_recv 零拷贝收 */
+    int         udp_bypass;            /* 1=半旁路：dispatcher 截获 dport，不进协议栈 socket */
 };
 
 /* ============ RX 统计 ============ */

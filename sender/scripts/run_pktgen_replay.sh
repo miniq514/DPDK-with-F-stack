@@ -29,11 +29,13 @@ RATE_MBPS=""
 LINE_GBPS=10
 DURATION=10
 COUNT=""
+# pktgen pcap 循环 + 线速突发会少发尾部；按包数留足余量，收端仍用原始 --count
+PKTGEN_SEND_MARGIN="${PKTGEN_SEND_MARGIN:-}"
 LCORES="0,1,2"
 CHANNELS=4
 FILE_PREFIX="udp_pktgen_tx"
 # pktgen 无法一次加载超大 pcap；模板包数，实际发送数由 set 0 count 控制
-PCAP_TEMPLATE_MAX=100000
+PCAP_TEMPLATE_MAX=5000
 CHECK_ONLY=0
 EXPECTED_DST_MAC="${DST_MAC:-}"
 
@@ -219,22 +221,36 @@ else
     echo "[OK]  HugePages_Free=${HP_FREE}"
 fi
 
+DPDK_BIND_DRIVER="${DPDK_BIND_DRIVER:-}"
+
+is_dpdk_bound() {
+    local pci="$1"
+    local line drv
+    [[ -x "${DEVBIND}" ]] || return 1
+    line="$("${DEVBIND}" -s 2>/dev/null | grep -i "${pci}" | head -1 || true)"
+    [[ -n "${line}" ]] || return 1
+    if [[ -n "${DPDK_BIND_DRIVER}" ]]; then
+        echo "${line}" | grep -qi "drv=${DPDK_BIND_DRIVER}"
+        return $?
+    fi
+    echo "${line}" | grep -Eqi 'drv=(vfio-pci|uio_pci_generic|igb_uio)'
+}
+
 if [[ -n "${PCI}" ]]; then
     echo "---- 网卡绑定状态 ----"
     if [[ -x "${DEVBIND}" ]]; then
         "${DEVBIND}" -s 2>/dev/null | grep -iE 'Network devices|drv=|unused=' || true
-        BOUND="$("${DEVBIND}" -s 2>/dev/null | grep -i "drv=vfio-pci" | grep -i "${PCI}" || true)"
-        if [[ -z "${BOUND}" ]]; then
-            echo "[!] PCI ${PCI} 未绑 vfio-pci（pktgen 需要）"
-            echo "    sudo modprobe vfio-pci"
-            echo "    sudo ${DEVBIND} -b vfio-pci ${PCI}"
+        if ! is_dpdk_bound "${PCI}"; then
+            echo "[!] PCI ${PCI} 未绑 DPDK 驱动（pktgen 需要 vfio-pci / uio_pci_generic / igb_uio）"
+            echo "    sudo modprobe uio_pci_generic  # 或 vfio-pci / igb_uio"
+            echo "    sudo ${DEVBIND} -b uio_pci_generic ${PCI}"
             echo "    [!] 确认 ${PCI} 不是 SSH 口!"
             if [[ "${CHECK_ONLY}" != "1" ]]; then
-                echo "[ABORT] 发包口未绑 vfio-pci" >&2
+                echo "[ABORT] 发包口未绑 DPDK 驱动" >&2
                 exit 2
             fi
         else
-            echo "[OK]  PCI ${PCI} 已绑 vfio-pci"
+            echo "[OK]  PCI ${PCI} 已绑 DPDK 驱动"
         fi
     else
         echo "[WARN] 未找到 ${DEVBIND}, 跳过绑定检查" >&2
@@ -257,29 +273,53 @@ estimate_send_secs() {
         frame_bits = 1400 * 8
         wire_bps = gbps * 1e9 * pct / 100.0
         secs = n * frame_bits / wire_bps
-        secs = secs * 1.10 + 1.0
-        if (secs < 3) secs = 3
+        # 留足余量：pcap 循环 + TX 队列 drain，避免 stop/quit 截断尾部
+        secs = secs * 2.5 + 8.0
+        if (secs < 12) secs = 12
         printf "%d", int(secs + 0.99)
     }'
+}
+
+pktgen_send_margin() {
+    local count="$1"
+    local margin="${PKTGEN_SEND_MARGIN:-}"
+    if [[ -z "${margin}" ]]; then
+        # 大流量下 pktgen 尾部截断更明显：按 0.5% + 512，上限 16384
+        margin=$(( count / 200 + 512 ))
+        if [[ "${margin}" -lt 128 ]]; then margin=128; fi
+        if [[ "${margin}" -gt 16384 ]]; then margin=16384; fi
+    fi
+    echo "${margin}"
 }
 
 write_cmd_file() {
     local f="$1"
     local wait_secs
+    local pktgen_count="${COUNT}"
+    local margin=0
     {
         echo "disable screen"
         echo "set 0 rate ${RATE}"
         if [[ -n "${COUNT}" ]]; then
-            wait_secs="$(estimate_send_secs "${COUNT}" "${RATE}" "${LINE_GBPS}")"
-            echo "set 0 count ${COUNT}"
+            margin="$(pktgen_send_margin "${COUNT}")"
+            pktgen_count=$(( COUNT + margin ))
+            wait_secs="$(estimate_send_secs "${pktgen_count}" "${RATE}" "${LINE_GBPS}")"
+            echo "set 0 count ${pktgen_count}"
             echo "start 0"
             echo "sleep ${wait_secs}"
+            echo "sleep 8"
+            echo "enable screen"
+            echo "sleep 2"
+            echo "page main"
+            echo "sleep 2"
         else
             echo "set 0 count 0"
             echo "start 0"
             echo "sleep ${DURATION}"
+            echo "sleep 2"
+            echo "enable screen"
+            echo "sleep 2"
         fi
-        echo "stop 0"
         echo "quit"
     } > "${f}"
 }
@@ -290,7 +330,9 @@ write_cmd_file "${CMD_FILE}"
 echo "---- pktgen 命令 (${CMD_FILE}) ----"
 cat "${CMD_FILE}"
 if [[ -n "${COUNT}" ]]; then
-    echo "[*] 估算发流 $(estimate_send_secs "${COUNT}" "${RATE}" "${LINE_GBPS}")s 后 stop/quit"
+    margin="$(pktgen_send_margin "${COUNT}")"
+    echo "[*] pktgen 目标 ${COUNT} 包 + 余量 ${margin} → set 0 count $((COUNT + margin))"
+    echo "[*] 估算发流 $(estimate_send_secs "$((COUNT + margin))" "${RATE}" "${LINE_GBPS}")s 后 quit"
 fi
 
 PCAP_ABS="$(cd "$(dirname "${PCAP}")" && pwd)/$(basename "${PCAP}")"
@@ -330,13 +372,36 @@ run_pktgen_bg() {
     wait "${PKTGEN_PID}"
     local rc=$?
     PKTGEN_PID=""
+    local tx_pkts=""
+    if [[ -f "${log_file}" ]]; then
+        cp -f "${log_file}" /tmp/last_pktgen.log 2>/dev/null || true
+        tx_pkts="$(grep -Eo 'TX count[[:space:]]*:[[:space:]]*[0-9,]+' "${log_file}" 2>/dev/null \
+            | tail -1 | grep -Eo '[0-9,]+' | tr -d ',' || true)"
+        if [[ -z "${tx_pkts}" ]]; then
+            tx_pkts="$(grep -Eo 'Tx Pkts[[:space:]]*:[[:space:]]*[0-9,]+' "${log_file}" 2>/dev/null \
+                | tail -1 | grep -Eo '[0-9,]+' | tr -d ',' || true)"
+        fi
+    fi
     if [[ "${rc}" -eq 0 ]]; then
-        echo "[OK]  pktgen 发流完成"
+        if [[ -n "${tx_pkts}" ]]; then
+            echo "[OK]  pktgen 发流完成 (TX=${tx_pkts})"
+        else
+            echo "[OK]  pktgen 发流完成"
+        fi
     elif [[ "${rc}" -eq 124 ]]; then
         echo "[WARN] pktgen 超时 (${tsec}s)，详见 ${log_file}" >&2
     elif [[ "${rc}" -ne 0 ]]; then
         echo "[WARN] pktgen 异常退出 rc=${rc}，详见 ${log_file}" >&2
         tail -20 "${log_file}" >&2 || true
+    fi
+    if [[ -n "${COUNT}" && -n "${tx_pkts}" ]]; then
+        local margin
+        margin="$(pktgen_send_margin "${COUNT}")"
+        if [[ "${tx_pkts}" -lt "${COUNT}" ]]; then
+            echo "[WARN] pktgen TX=${tx_pkts} < 收端期望 ${COUNT}（发端少发）" >&2
+        elif [[ "${tx_pkts}" -lt "$((COUNT + margin))" ]]; then
+            echo "[WARN] pktgen TX=${tx_pkts} < 发端目标 $((COUNT + margin))（余量未打满，尾部可能截断）" >&2
+        fi
     fi
     rm -f "${log_file}" 2>/dev/null || true
     return "${rc}"

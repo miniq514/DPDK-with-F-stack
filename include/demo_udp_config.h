@@ -74,7 +74,7 @@
 #define UDP_RX_MEMPOOL_CACHE_SIZE   256u   /* rte_mempool_create per-lcore cache */
 
 /* ============ F-Stack 收端（IPv6，与 docs/README fibre/dac 1.0.1 对齐） ============ */
-#define UDP_RX_BIND_IP6             "1111:2222:1111:2222:1111:2222:1111:0002"
+#define UDP_RX_BIND_IP6             "1111:2222:1111:2222:1111:2222:1111:0003"
 
 #define UDP_GEN_DEFAULT_COUNT   100
 #define UDP_GEN_DEFAULT_PAYLOAD 1400
